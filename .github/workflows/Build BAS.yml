@@ -1,210 +1,78 @@
-name: 彩-视频转BAS弹幕 (video → SVG → BAS)
+name: Video → SVG → BAS Danmaku
 
 on:
   workflow_dispatch:
     inputs:
       video_file:
-        description: '视频文件路径（仓库相对路径）。若使用上次运行上传的 Artifact，请留空并填写 artifact_name。'
-        required: false
+        description: '视频文件名（仓库根目录，或用下方artifact名称下载）'
+        required: true
         default: 'input.mp4'
       artifact_name:
-        description: '（可选）下载上一次或其他工作流上传的 Artifact 名称作为输入视频'
+        description: '（可选）若视频不在仓库，填写Artifact名称以下载'
         required: false
-        default: ''
       fps:
-        description: '抽帧帧率（传给 ffmpeg 与 -fps 参数）'
+        description: '抽帧帧率'
         required: true
-        default: '5'
-      concurrency:
-        description: '2-处理SVG 并发数（-c）'
-        required: true
-        default: '4'
-      viewbox_w:
+        default: '30'
+      width:
         description: 'BAS 画布宽（-w）'
         required: true
         default: '4000'
-      viewbox_h:
+      height:
         description: 'BAS 画布高（-h）'
         required: true
         default: '3620'
       maxsize:
-        description: '单个BAS文本最大字符数（-maxsize）超过则切分'
-        required: true
-        default: '500000'
-      start_offset_ms:
-        description: '起始时间偏移（-starttime，单位毫秒）'
+        description: '每个TXT最大弹幕数（-–maxsize）'
         required: true
         default: '3000'
-      upload_intermediates:
-        description: '是否上传中间产物（SVG / JSON）用于调试'
-        required: true
-        default: 'false'
-        type: choice
-        options: ['true','false']
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    env:
-      # 你把「彩-视频转bas弹幕」项目内容放到仓库哪个目录？
-      # 若在仓库根目录，保持为 . （点）；若在子目录，例如 ./video2bas，请改为相应路径。
-      PROJECT_DIR: ./
-      FRAMES_DIR: frames
-      SVG_DIR: svgs
-      JSON_DIR: svgjson
-      OUT_DIR: bas_output
+
     steps:
-      - name: Checkout repository
+      - name: 检出仓库
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 22.18.0
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22.18.0
-
-      - name: Install system tools (ffmpeg, potrace, ImageMagick, GraphicsMagick)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg potrace imagemagick graphicsmagick
-
-      - name: Ensure directories
-        run: |
-          mkdir -p "$FRAMES_DIR" "$SVG_DIR" "$JSON_DIR" "$OUT_DIR"
-
-      - name: (Optional) Download input video from artifact
-        if: ${{ inputs.artifact_name != '' }}
+      - name: 下载 artifact (可选)
+        if: ${{ github.event.inputs.artifact_name != '' }}
         uses: actions/download-artifact@v4
         with:
-          name: ${{ inputs.artifact_name }}
+          name: ${{ github.event.inputs.artifact_name }}
           path: .
 
-      - name: Resolve input video path
-        id: videopath
-        shell: bash
+      - name: 安装依赖
         run: |
-          set -euo pipefail
-          if [[ -n "${{ inputs.artifact_name }}" ]]; then
-            # 优先尝试用调度时给的 video_file；若为空，则自动寻找当前目录下第一个 .mp4
-            if [[ -n "${{ inputs.video_file }}" && -f "${{ inputs.video_file }}" ]]; then
-              echo "video=${{ inputs.video_file }}" >> $GITHUB_OUTPUT
-            else
-              cand=$(ls -1 *.mp4 2>/dev/null | head -n1 || true)
-              if [[ -z "$cand" ]]; then
-                echo "未找到输入视频；请提供 video_file 或正确的 artifact_name" >&2
-                exit 1
-              fi
-              echo "video=$cand" >> $GITHUB_OUTPUT
-            fi
-          else
-            # 直接使用仓库相对路径
-            if [[ ! -f "${{ inputs.video_file }}" ]]; then
-              echo "找不到 ${{ inputs.video_file }} ，请确认文件已提交或使用 artifact_name" >&2
-              exit 1
-            fi
-            echo "video=${{ inputs.video_file }}" >> $GITHUB_OUTPUT
-          fi
-          echo "Resolved video: $(cat $GITHUB_OUTPUT)"
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg potrace imagemagick
+          npm install jsdom commander cli-progress ora
 
-      - name: Extract frames with ffmpeg
+      - name: 抽帧 PNG
         run: |
-          ffmpeg -y -loglevel error -stats \
-            -i "${{ steps.videopath.outputs.video }}" \
-            -vf fps=${{ inputs.fps }} \
-            "$FRAMES_DIR/frame_%05d.png"
+          mkdir -p frames
+          ffmpeg -i "${{ github.event.inputs.video_file }}" -vf fps=${{ github.event.inputs.fps }} frames/frame_%05d.png
 
-      - name: Install Node dependencies for 彩-视频转bas弹幕
+      - name: PNG → SVG
         run: |
-          if [[ ! -f "$PROJECT_DIR/package.json" ]]; then
-            echo "在 $PROJECT_DIR 下未找到 package.json，请将项目解压到该目录或修改 PROJECT_DIR。" >&2
-            exit 1
-          fi
-          npm ci --prefix "$PROJECT_DIR"
+          node 2-批量转换svg.js -d frames -o svgs -c 4
 
-      - name: Locate pipeline scripts (2/3/4)
-        id: scripts
-        shell: bash
+      - name: SVG → JSON
         run: |
-          set -euo pipefail
-          # 兼容原始中文文件名（可能乱码），用正则模糊匹配
-          S2=$(ls "$PROJECT_DIR" | grep -E '^2-.*svg\.js$' | head -n1 || true)
-          S3=$(ls "$PROJECT_DIR" | grep -E '^3-.*json\.js$' | head -n1 || true)
-          S4=$(ls "$PROJECT_DIR" | grep -E '^4-.*bas.*\.js$' | head -n1 || true)
-          if [[ -z "$S2" || -z "$S3" || -z "$S4" ]]; then
-            echo "未定位到 2/3/4 三个脚本。请确认你已把项目原始 JS 脚本放在 $PROJECT_DIR 下。" >&2
-            echo "发现："; ls -1 "$PROJECT_DIR" | sed 's/^/  - /'
-            exit 1
-          fi
-          echo "s2=$S2" >> $GITHUB_OUTPUT
-          echo "s3=$S3" >> $GITHUB_OUTPUT
-          echo "s4=$S4" >> $GITHUB_OUTPUT
+          node 3-批量转换json.js -d svgs -o svgjson -s 1
 
-      - name: 2) PNG → SVG（potrace/mkbitmap）
-        shell: bash
+      - name: JSON → BAS TXT
         run: |
-          node "$PROJECT_DIR/${{ steps.scripts.outputs.s2 }}" \
-            -d "$FRAMES_DIR" \
-            -c ${{ inputs.concurrency }} \
-            --out "$SVG_DIR"
-        env:
-          # 如 2-脚本支持阈值、黑白反转等，可在这里追加自定义环境或参数
-          LANG: C.UTF-8
+          node 4-json数据转换bas弹幕.js \
+            -i svgjson -o bas_output \
+            -w ${{ github.event.inputs.width }} \
+            -h ${{ github.event.inputs.height }} \
+            --fps ${{ github.event.inputs.fps }} \
+            --maxsize ${{ github.event.inputs.maxsize }} \
+            --starttime 0
 
-      - name: 3) SVG → JSON（jsdom 批处理）
-        shell: bash
-        run: |
-          node "$PROJECT_DIR/${{ steps.scripts.outputs.s3 }}" \
-            -s 1 \
-            -d "$SVG_DIR"
-          # 该脚本默认把结果写入 ./svgjson；为稳妥起见，如需强制自定义目录，可在脚本中把 outputDir 改为 $JSON_DIR
-
-      - name: Normalize JSON output path (if script used default ./svgjson)
-        shell: bash
-        run: |
-          if [[ -d svgjson && "$JSON_DIR" != "svgjson" ]]; then
-            rsync -a svgjson/ "$JSON_DIR"/
-          fi
-
-      - name: 4) JSON → BAS 文本
-        shell: bash
-        run: |
-          node "$PROJECT_DIR/${{ steps.scripts.outputs.s4 }}" \
-            -w ${{ inputs.viewbox_w }} \
-            -h ${{ inputs.viewbox_h }} \
-            -fps ${{ inputs.fps }} \
-            -maxsize ${{ inputs.maxsize }} \
-            -starttime ${{ inputs.start_offset_ms }}
-          # 输出 *.txt（文件名形如：{start+offset}_{index}.txt）
-          mv -f ./*.txt "$OUT_DIR"/ 2>/dev/null || true
-
-      - name: (Optional) Upload SVGs
-        if: ${{ inputs.upload_intermediates == 'true' }}
+      - name: 上传输出结果
         uses: actions/upload-artifact@v4
         with:
-          name: svgs
-          path: ${{ env.SVG_DIR }}/
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: (Optional) Upload JSON batches
-        if: ${{ inputs.upload_intermediates == 'true' }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: svgjson
-          path: ${{ env.JSON_DIR }}/
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload BAS outputs
-        uses: actions/upload-artifact@v4
-        with:
-          name: bas_txt
-          path: ${{ env.OUT_DIR }}/
-          if-no-files-found: error
-          retention-days: 30
-
-      - name: Summary
-        run: |
-          echo "✅ 完成：${{ steps.videopath.outputs.video }} → BAS 文本" >> $GITHUB_STEP_SUMMARY
-          echo "- 抽帧：${{ inputs.fps }} FPS" >> $GITHUB_STEP_SUMMARY
-          echo "- 画布：${{ inputs.viewbox_w }} × ${{ inputs.viewbox_h }}" >> $GITHUB_STEP_SUMMARY
-          echo "- 输出目录：$OUT_DIR （已作为 Artifact: bas_txt 上传）" >> $GITHUB_STEP_SUMMARY
+          name: bas_output
+          path: bas_output

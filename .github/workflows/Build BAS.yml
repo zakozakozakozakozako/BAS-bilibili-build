@@ -68,8 +68,7 @@ jobs:
             -w ${{ github.event.inputs.width }} \
             -h ${{ github.event.inputs.height }} \
             --fps ${{ github.event.inputs.fps }} \
-            --maxsize ${{ github.event.inputs.maxsize }} \
-            --starttime 0
+            --maxsize ${{ github.event.inputs.maxsize }}
 
       - name: 上传输出结果
         uses: actions/upload-artifact@v4

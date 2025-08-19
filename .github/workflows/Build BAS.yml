@@ -48,7 +48,7 @@ jobs:
     env:
       # 你把「彩-视频转bas弹幕」项目内容放到仓库哪个目录？
       # 若在仓库根目录，保持为 . （点）；若在子目录，例如 ./video2bas，请改为相应路径。
-      PROJECT_DIR: ./video2bas
+      PROJECT_DIR: ./
       FRAMES_DIR: frames
       SVG_DIR: svgs
       JSON_DIR: svgjson

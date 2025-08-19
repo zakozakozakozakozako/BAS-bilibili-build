@@ -32,31 +32,27 @@ let processedCount = 0;
 function findPngFiles(dir) {
     const results = [];
     const files = fs.readdirSync(dir);
-
     files.forEach(file => {
         const fullPath = path.join(dir, file);
         const stat = fs.statSync(fullPath);
-
         if (stat && stat.isDirectory()) {
             results.push(...findPngFiles(fullPath));
         } else if (path.extname(file).toLowerCase() === '.png') {
             results.push(fullPath);
         }
     });
-
     return results;
 }
 
 async function convertFile(filePath) {
     const baseName = path.basename(filePath, '.png');
-
     const bmpPath = path.join(outDir, `${baseName}.bmp`);
     const svgPath = path.join(outDir, `${baseName}.svg`);
 
     progressBar.update(processedCount, { filename: `${baseName}.png` });
 
     try {
-        await executeCommand(`magick convert "${filePath}" "${bmpPath}"`);
+        await executeCommand(`magick "${filePath}" "${bmpPath}"`);
         await executeCommand(`potrace "${bmpPath}" -s -o "${svgPath}"`);
         fs.unlinkSync(bmpPath);
         return { success: true, file: filePath };
@@ -91,7 +87,6 @@ async function main() {
         }
 
         spinner.succeed(`找到 ${fileCount} 个PNG文件`);
-
         console.log('\n');
         progressBar.start(fileCount, 0, { filename: '' });
 
@@ -116,7 +111,6 @@ async function main() {
                         results.push({ success: false, file: filePath, error });
                         progressBar.update(processedCount);
                     });
-
                 active.add(promise);
             } else {
                 await Promise.race(active);

@@ -10,7 +10,6 @@ program
   .option('-h, --height <number>', 'BAS画布高', '3620')
   .option('--fps <number>', '帧率', '30')
   .option('--maxsize <number>', '每个文件最大弹幕数', '3000')
-  .option('--starttime <number>', '起始时间 (ms)', '0')
   .parse(process.argv);
 
 const options = program.opts();
@@ -22,7 +21,6 @@ const fps = parseInt(options.fps);
 const width = parseInt(options.width);
 const height = parseInt(options.height);
 const maxSize = parseInt(options.maxsize);
-let startTime = parseInt(options.starttime);
 
 function flipSvgPath(d) {
   return d.replace(/([0-9]*\.?[0-9]+)/g, (num, idx, str) => {
@@ -31,15 +29,25 @@ function flipSvgPath(d) {
   });
 }
 
+// 把 JSON 转为 BAS 语法
 function jsonToBas(jsonArr, startFrame) {
   let lines = [];
   jsonArr.forEach((frame, idx) => {
     const frameNum = startFrame + idx;
-    const time = startTime + Math.round((frameNum / fps) * 1000);
-    frame.paths.forEach(p => {
+    const duration = Math.round(1000 / fps); // 每帧时长 (ms)
+    frame.paths.forEach((p, pidx) => {
       if (!p.d) return;
       const flipped = flipSvgPath(p.d);
-      lines.push(`${time},0,25,16777215,baseline,${flipped}`);
+
+      const objName = `f${frameNum}_p${pidx}`;
+      // 定义路径对象
+      lines.push(`def path ${objName} {`);
+      lines.push(`  d = "${flipped}"`);
+      lines.push(`  color = 0xffffff`);
+      lines.push(`}`);
+      // 设置显示时长
+      lines.push(`set ${objName} { alpha = 1 } ${duration}ms`);
+      lines.push(""); // 空行分隔
     });
   });
   return lines;
@@ -69,7 +77,7 @@ async function main() {
     frameCount += arr.length;
 
     if (allLines.length >= maxSize || i === files.length - 1) {
-      const outPath = path.join(outDir, `output_part${part}.txt`);
+      const outPath = path.join(outDir, `output_part${part}.bas`);
       fs.writeFileSync(outPath, allLines.join('\n'), 'utf-8');
       allLines = [];
       part++;
@@ -77,7 +85,7 @@ async function main() {
   }
 
   progressBar.stop();
-  console.log('\n✓ BAS 转换完成!\n');
+  console.log('\n✓ BAS 脚本生成完成!\n');
 }
 
 main();

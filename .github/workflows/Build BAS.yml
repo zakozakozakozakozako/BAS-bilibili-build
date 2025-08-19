@@ -1,234 +1,210 @@
-name: Video → SVG → BAS Danmaku
+name: 彩-视频转BAS弹幕 (video → SVG → BAS)
 
 on:
   workflow_dispatch:
     inputs:
       video_file:
-        description: "仓库根目录中的视频文件名（例如：input.mp4）"
-        required: true
-        default: "input.mp4"
+        description: '视频文件路径（仓库相对路径）。若使用上次运行上传的 Artifact，请留空并填写 artifact_name。'
+        required: false
+        default: 'input.mp4'
+      artifact_name:
+        description: '（可选）下载上一次或其他工作流上传的 Artifact 名称作为输入视频'
+        required: false
+        default: ''
       fps:
-        description: "抽帧/时间换算的帧率（与 -fps 保持一致）"
+        description: '抽帧帧率（传给 ffmpeg 与 -fps 参数）'
         required: true
-        default: "5"
-      palette_size:
-        description: "颜色量化的调色板大小（每帧最多保留多少种颜色）"
-        required: true
-        default: "16"
+        default: '5'
       concurrency:
-        description: "PNG→SVG 并发数"
+        description: '2-处理SVG 并发数（-c）'
         required: true
-        default: "4"
+        default: '4'
       viewbox_w:
-        description: "BAS 画布宽（-w）"
+        description: 'BAS 画布宽（-w）'
         required: true
-        default: "4000"
+        default: '4000'
       viewbox_h:
-        description: "BAS 画布高（-h）"
+        description: 'BAS 画布高（-h）'
         required: true
-        default: "3620"
-      max_chars:
-        description: "单个 BAS 文本最大字符数（-maxsize）"
+        default: '3620'
+      maxsize:
+        description: '单个BAS文本最大字符数（-maxsize）超过则切分'
         required: true
-        default: "500000"
+        default: '500000'
       start_offset_ms:
-        description: "起始偏移毫秒（-starttime）"
+        description: '起始时间偏移（-starttime，单位毫秒）'
         required: true
-        default: "3000"
-      json_start_index:
-        description: "3-*.js 的起始 JSON 序号（-s）"
+        default: '3000'
+      upload_intermediates:
+        description: '是否上传中间产物（SVG / JSON）用于调试'
         required: true
-        default: "1"
+        default: 'false'
+        type: choice
+        options: ['true','false']
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      NODE_OPTIONS: "--max-old-space-size=8192"
-    defaults:
-      run:
-        shell: bash
-
+      # 你把「彩-视频转bas弹幕」项目内容放到仓库哪个目录？
+      # 若在仓库根目录，保持为 . （点）；若在子目录，例如 ./video2bas，请改为相应路径。
+      PROJECT_DIR: ./video2bas
+      FRAMES_DIR: frames
+      SVG_DIR: svgs
+      JSON_DIR: svgjson
+      OUT_DIR: bas_output
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show inputs
-        run: |
-          echo "video_file=${{ inputs.video_file }}"
-          echo "fps=${{ inputs.fps }}"
-          echo "palette_size=${{ inputs.palette_size }}"
-          echo "concurrency=${{ inputs.concurrency }}"
-          echo "viewbox_w=${{ inputs.viewbox_w }}"
-          echo "viewbox_h=${{ inputs.viewbox_h }}"
-          echo "max_chars=${{ inputs.max_chars }}"
-          echo "start_offset_ms=${{ inputs.start_offset_ms }}"
-          echo "json_start_index=${{ inputs.json_start_index }}"
-
-      - name: Install system deps (ffmpeg, potrace, ImageMagick 7)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            ffmpeg potrace build-essential \
-            libpng-dev libjpeg-dev libtiff-dev libwebp-dev libltdl-dev wget
-
-          wget https://imagemagick.org/archive/ImageMagick.tar.gz
-          tar xvzf ImageMagick.tar.gz
-          cd ImageMagick-7*
-
-          # 编译安装？
-          ./configure --with-modules --with-perl --with-png=yes --with-jpeg=yes
-          make -j$(nproc)
-          sudo make install
-          sudo ldconfig /usr/local/lib
-          export PATH=/usr/local/bin:$PATH
-
-          # 检查版本和 PNG 支持
-          magick -version
-          magick -list format | grep PNG
-          ffmpeg -version
-          potrace -v
-
-      - name: Setup Node.js
+      - name: Setup Node.js 22.18.0
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 22.18.0
 
-      - name: Locate tool folder (the one containing 2/3/4 scripts)
-        id: locate
+      - name: Install system tools (ffmpeg, potrace, ImageMagick, GraphicsMagick)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg potrace imagemagick graphicsmagick
+
+      - name: Ensure directories
+        run: |
+          mkdir -p "$FRAMES_DIR" "$SVG_DIR" "$JSON_DIR" "$OUT_DIR"
+
+      - name: (Optional) Download input video from artifact
+        if: ${{ inputs.artifact_name != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: .
+
+      - name: Resolve input video path
+        id: videopath
+        shell: bash
         run: |
           set -euo pipefail
-          # 找到包含 4-json*.js 的目录，基本等于压缩包里的主目录（避免乱码路径写死）
-          TOOL_DIR="$(dirname "$(git ls-files | grep -E '/4-.*bas.*\.js$' | head -n1)")"
-          if [ -z "${TOOL_DIR}" ]; then
-            echo "❌ 未找到 4-json…bas…js 工具脚本" >&2
-            exit 1
+          if [[ -n "${{ inputs.artifact_name }}" ]]; then
+            # 优先尝试用调度时给的 video_file；若为空，则自动寻找当前目录下第一个 .mp4
+            if [[ -n "${{ inputs.video_file }}" && -f "${{ inputs.video_file }}" ]]; then
+              echo "video=${{ inputs.video_file }}" >> $GITHUB_OUTPUT
+            else
+              cand=$(ls -1 *.mp4 2>/dev/null | head -n1 || true)
+              if [[ -z "$cand" ]]; then
+                echo "未找到输入视频；请提供 video_file 或正确的 artifact_name" >&2
+                exit 1
+              fi
+              echo "video=$cand" >> $GITHUB_OUTPUT
+            fi
+          else
+            # 直接使用仓库相对路径
+            if [[ ! -f "${{ inputs.video_file }}" ]]; then
+              echo "找不到 ${{ inputs.video_file }} ，请确认文件已提交或使用 artifact_name" >&2
+              exit 1
+            fi
+            echo "video=${{ inputs.video_file }}" >> $GITHUB_OUTPUT
           fi
-          echo "tool_dir=${TOOL_DIR}" >> "$GITHUB_OUTPUT"
-          echo "Tool dir: ${TOOL_DIR}"
-
-      - name: Install Node deps for tools
-        run: |
-          set -euo pipefail
-          npm ci --prefix "${{ steps.locate.outputs.tool_dir }}"
-
-      - name: Prepare working dirs
-        run: |
-          mkdir -p work/frames work/split work/svgs svgjson
+          echo "Resolved video: $(cat $GITHUB_OUTPUT)"
 
       - name: Extract frames with ffmpeg
         run: |
-          set -euo pipefail
-          ffmpeg -y -i "${{ inputs.video_file }}" -vf "fps=${{ inputs.fps }}" "work/frames/%06d.png"
+          ffmpeg -y -loglevel error -stats \
+            -i "${{ steps.videopath.outputs.video }}" \
+            -vf fps=${{ inputs.fps }} \
+            "$FRAMES_DIR/frame_%05d.png"
 
-      - name: Color quantize & split per-frame into RRGGBB layers (ImageMagick)
+      - name: Install Node dependencies for 彩-视频转bas弹幕
+        run: |
+          if [[ ! -f "$PROJECT_DIR/package.json" ]]; then
+            echo "在 $PROJECT_DIR 下未找到 package.json，请将项目解压到该目录或修改 PROJECT_DIR。" >&2
+            exit 1
+          fi
+          npm ci --prefix "$PROJECT_DIR"
+
+      - name: Locate pipeline scripts (2/3/4)
+        id: scripts
+        shell: bash
         run: |
           set -euo pipefail
-          FPS="${{ inputs.fps }}"
-          PALETTE="${{ inputs.palette_size }}"
+          # 兼容原始中文文件名（可能乱码），用正则模糊匹配
+          S2=$(ls "$PROJECT_DIR" | grep -E '^2-.*svg\.js$' | head -n1 || true)
+          S3=$(ls "$PROJECT_DIR" | grep -E '^3-.*json\.js$' | head -n1 || true)
+          S4=$(ls "$PROJECT_DIR" | grep -E '^4-.*bas.*\.js$' | head -n1 || true)
+          if [[ -z "$S2" || -z "$S3" || -z "$S4" ]]; then
+            echo "未定位到 2/3/4 三个脚本。请确认你已把项目原始 JS 脚本放在 $PROJECT_DIR 下。" >&2
+            echo "发现："; ls -1 "$PROJECT_DIR" | sed 's/^/  - /'
+            exit 1
+          fi
+          echo "s2=$S2" >> $GITHUB_OUTPUT
+          echo "s3=$S3" >> $GITHUB_OUTPUT
+          echo "s4=$S4" >> $GITHUB_OUTPUT
 
-          idx=0
-          for f in work/frames/*.png; do
-            [ -e "$f" ] || { echo "No frames found."; exit 1; }
-            idx=$((idx+1))
-            # 帧时间（毫秒）
-            # (idx-1)/FPS * 1000
-            ms=$(python3 -c "fps=float('${FPS}'); i=${idx}; print(int(((i-1)/fps)*1000))")
-            folder="work/split/${idx}_${ms}"
-            mkdir -p "$folder"
-
-            # 先量化到有限颜色，避免唯一色过多
-            qpng="${folder}/_quant.png"
-            magick "$f" -alpha off -dither FloydSteinberg -colors "$PALETTE" "$qpng"
-
-            # 列出按频次排序的颜色（#RRGGBB）
-            mapfile -t COLORS < <(magick "$qpng" -format "%c" histogram:info:- \
-              | sort -nr \
-              | awk -F'#' '{if (NF>1){split($2,a,/[^0-9A-Fa-f]/); if(length(a[1])==6) print toupper(a[1])}}')
-
-            # 针对每个颜色，生成二值遮罩 PNG（白色=该色，黑色=其它）
-            # 文件命名：RRGGBB.png —— 正好满足 3-*.js 的文件名规则（长度10含扩展名）
-            for hex in "${COLORS[@]}"; do
-              # 防止过多微小颜色，按 PALETTE 截断
-              [ -f "${folder}/${hex}.png" ] && continue
-              [ "$(ls "${folder}"/*.png 2>/dev/null | wc -l)" -ge "$PALETTE" ] && break
-              magick "$qpng" -alpha off -fill white -opaque "#${hex}" -fill black +opaque "#${hex}" "${folder}/${hex}.png"
-            done
-
-            rm -f "$qpng"
-          done
-
-      - name: PNG → SVG (potrace), recursive
+      - name: 2) PNG → SVG（potrace/mkbitmap）
+        shell: bash
         run: |
-          set -euo pipefail
-          node "${{ steps.locate.outputs.tool_dir }}/2-"*svg.js \
-            -d "work/split" \
-            -c "${{ inputs.concurrency }}"
+          node "$PROJECT_DIR/${{ steps.scripts.outputs.s2 }}" \
+            -d "$FRAMES_DIR" \
+            -c ${{ inputs.concurrency }} \
+            --out "$SVG_DIR"
         env:
-          NODE_NO_WARNINGS: '1'
+          # 如 2-脚本支持阈值、黑白反转等，可在这里追加自定义环境或参数
+          LANG: C.UTF-8
 
-      - name: SVG → JSON (batched)
+      - name: 3) SVG → JSON（jsdom 批处理）
+        shell: bash
         run: |
-          set -euo pipefail
-          node "${{ steps.locate.outputs.tool_dir }}/3-"*json.js \
-            -d "work/split" \
-            -s "${{ inputs.json_start_index }}"
-        env:
-          NODE_NO_WARNINGS: '1'
+          node "$PROJECT_DIR/${{ steps.scripts.outputs.s3 }}" \
+            -s 1 \
+            -d "$SVG_DIR"
+          # 该脚本默认把结果写入 ./svgjson；为稳妥起见，如需强制自定义目录，可在脚本中把 outputDir 改为 $JSON_DIR
 
-      - name: JSON → BAS 弹幕（.txt）
+      - name: Normalize JSON output path (if script used default ./svgjson)
+        shell: bash
         run: |
-          set -euo pipefail
-          # 在仓库根目录执行（4-*.js 固定读取 ./svgjson）
-          node "${{ steps.locate.outputs.tool_dir }}/4-"*bas*.js \
-            -w "${{ inputs.viewbox_w }}" \
-            -h "${{ inputs.viewbox_h }}" \
-            -maxsize "${{ inputs.max_chars }}" \
-            -starttime "${{ inputs.start_offset_ms }}" \
-            -fps "${{ inputs.fps }}"
-        env:
-          NODE_NO_WARNINGS: '1'
+          if [[ -d svgjson && "$JSON_DIR" != "svgjson" ]]; then
+            rsync -a svgjson/ "$JSON_DIR"/
+          fi
 
-      - name: Collect artifacts
+      - name: 4) JSON → BAS 文本
+        shell: bash
         run: |
-          mkdir -p out/bas_txt out/frames_png out/color_split_png out/svgs out/svgjson
-          # bas txt
-          find . -maxdepth 1 -type f -name "*_[0-9]*.txt" -print0 | xargs -0 -I{} cp "{}" out/bas_txt/ || true
-          # frames
-          cp -r work/frames/* out/frames_png/ || true
-          # split
-          find work/split -type f -name "*.png" -print0 | xargs -0 -I{} bash -c 'd=$(dirname "{}"); base=$(basename "{}"); mkdir -p "out/color_split_png/${d#work/split/}"; cp "{}" "out/color_split_png/${d#work/split/}/${base}"' || true
-          # svgs（与分层目录平行）
-          find work/split -type f -name "*.svg" -print0 | xargs -0 -I{} bash -c 'd=$(dirname "{}"); base=$(basename "{}"); mkdir -p "out/svgs/${d#work/split/}"; cp "{}" "out/svgs/${d#work/split/}/${base}"' || true
-          # svgjson
-          cp -r svgjson/* out/svgjson/ || true
+          node "$PROJECT_DIR/${{ steps.scripts.outputs.s4 }}" \
+            -w ${{ inputs.viewbox_w }} \
+            -h ${{ inputs.viewbox_h }} \
+            -fps ${{ inputs.fps }} \
+            -maxsize ${{ inputs.maxsize }} \
+            -starttime ${{ inputs.start_offset_ms }}
+          # 输出 *.txt（文件名形如：{start+offset}_{index}.txt）
+          mv -f ./*.txt "$OUT_DIR"/ 2>/dev/null || true
 
-      - name: Upload BAS txt
-        uses: actions/upload-artifact@v4
-        with:
-          name: bas_txt
-          path: out/bas_txt
-
-      - name: Upload frames (PNG)
-        uses: actions/upload-artifact@v4
-        with:
-          name: frames_png
-          path: out/frames_png
-
-      - name: Upload color-split PNG
-        uses: actions/upload-artifact@v4
-        with:
-          name: color_split_png
-          path: out/color_split_png
-
-      - name: Upload SVGs
+      - name: (Optional) Upload SVGs
+        if: ${{ inputs.upload_intermediates == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: svgs
-          path: out/svgs
+          path: ${{ env.SVG_DIR }}/
+          if-no-files-found: ignore
+          retention-days: 14
 
-      - name: Upload svgjson
+      - name: (Optional) Upload JSON batches
+        if: ${{ inputs.upload_intermediates == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: svgjson
-          path: out/svgjson
+          path: ${{ env.JSON_DIR }}/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload BAS outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: bas_txt
+          path: ${{ env.OUT_DIR }}/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "✅ 完成：${{ steps.videopath.outputs.video }} → BAS 文本" >> $GITHUB_STEP_SUMMARY
+          echo "- 抽帧：${{ inputs.fps }} FPS" >> $GITHUB_STEP_SUMMARY
+          echo "- 画布：${{ inputs.viewbox_w }} × ${{ inputs.viewbox_h }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 输出目录：$OUT_DIR （已作为 Artifact: bas_txt 上传）" >> $GITHUB_STEP_SUMMARY

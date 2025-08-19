@@ -1,82 +1,83 @@
-#!/usr/bin/env node
-/**
- * 4) JSON → BAS 文本
- * 适配 GitHub Actions 工作流，支持参数：
- *   -i 输入 JSON 目录（默认 ./svgjson）
- *   -o 输出目录（默认 ./bas_output）
- *   -w 画布宽
- *   -h 画布高
- *   -fps 帧率
- *   -maxsize 单文件最大字符数
- *   -starttime 起始时间偏移（毫秒）
- */
-
 const fs = require('fs');
 const path = require('path');
+const { program } = require('commander');
+const progress = require('cli-progress');
 
-// 简单参数解析器
-function getArg(flag, def) {
-  const idx = process.argv.indexOf(flag);
-  if (idx !== -1 && idx + 1 < process.argv.length) {
-    return process.argv[idx + 1];
-  }
-  return def;
+program
+  .option('-i, --input <path>', '输入JSON目录', './svgjson')
+  .option('-o, --out <path>', 'BAS输出目录', './bas_output')
+  .option('-w, --width <number>', 'BAS画布宽', '4000')
+  .option('-h, --height <number>', 'BAS画布高', '3620')
+  .option('--fps <number>', '帧率', '30')
+  .option('--maxsize <number>', '每个文件最大弹幕数', '3000')
+  .option('--starttime <number>', '起始时间 (ms)', '0')
+  .parse(process.argv);
+
+const options = program.opts();
+const inputDir = options.input;
+const outDir = options.out;
+if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+
+const fps = parseInt(options.fps);
+const width = parseInt(options.width);
+const height = parseInt(options.height);
+const maxSize = parseInt(options.maxsize);
+let startTime = parseInt(options.starttime);
+
+function flipSvgPath(d) {
+  return d.replace(/([0-9]*\.?[0-9]+)/g, (num, idx, str) => {
+    if (str[idx - 1] === '-' || (idx > 0 && /[a-zA-Z]/.test(str[idx - 1]))) return num;
+    return (height - parseFloat(num)).toString();
+  });
 }
 
-const inDir = getArg('-i', './svgjson');
-const outDir = getArg('-o', './bas_output');
-const width = parseInt(getArg('-w', '4000'), 10);
-const height = parseInt(getArg('-h', '3620'), 10);
-const fps = parseFloat(getArg('-fps', '5'));
-const maxSize = parseInt(getArg('-maxsize', '500000'), 10);
-const startOffset = parseInt(getArg('-starttime', '3000'), 10);
-
-// 确保输出目录存在
-if (!fs.existsSync(outDir)) {
-  fs.mkdirSync(outDir, { recursive: true });
+function jsonToBas(jsonArr, startFrame) {
+  let lines = [];
+  jsonArr.forEach((frame, idx) => {
+    const frameNum = startFrame + idx;
+    const time = startTime + Math.round((frameNum / fps) * 1000);
+    frame.paths.forEach(p => {
+      if (!p.d) return;
+      const flipped = flipSvgPath(p.d);
+      lines.push(`${time},0,25,16777215,baseline,${flipped}`);
+    });
+  });
+  return lines;
 }
 
-// 列出输入 JSON 文件
-let files = fs.readdirSync(inDir).filter(f => f.endsWith('.json'));
-files.sort();
+async function main() {
+  const files = fs.readdirSync(inputDir).filter(f => f.endsWith('.json')).sort();
+  const progressBar = new progress.Bar({
+    format: '{bar} | {percentage}% | 已处理: {value}/{total} | 当前: {filename}',
+    barCompleteChar: '\u2588',
+    barIncompleteChar: '\u2591',
+    hideCursor: true,
+    clearOnComplete: true
+  });
+  progressBar.start(files.length, 0, { filename: '' });
 
-console.log(`📂 输入目录: ${inDir}`);
-console.log(`📂 输出目录: ${outDir}`);
-console.log(`🖼 画布: ${width}x${height}, fps=${fps}`);
-console.log(`📝 最大字符数: ${maxSize}, 起始偏移: ${startOffset}ms`);
-console.log(`共 ${files.length} 个 JSON 批次`);
+  let allLines = [];
+  let part = 1;
+  let frameCount = 0;
 
-let fileIndex = 0;
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    progressBar.update(i + 1, { filename: f });
+    const arr = JSON.parse(fs.readFileSync(path.join(inputDir, f), 'utf-8'));
+    const basLines = jsonToBas(arr, frameCount);
+    allLines.push(...basLines);
+    frameCount += arr.length;
 
-for (let i = 0; i < files.length; i++) {
-  const filePath = path.join(inDir, files[i]);
-  const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-
-  let basLines = [];
-  for (const shape of data.shapes) {
-    // 这里保留你原本的 JSON → BAS 逻辑
-    // 假设 shape 已经包含坐标、时间等信息
-    const line = `...`; // ← 替换成你的转换规则
-    basLines.push(line);
+    if (allLines.length >= maxSize || i === files.length - 1) {
+      const outPath = path.join(outDir, `output_part${part}.txt`);
+      fs.writeFileSync(outPath, allLines.join('\n'), 'utf-8');
+      allLines = [];
+      part++;
+    }
   }
 
-  let content = basLines.join('\n');
-
-  // 如果内容超过 maxSize，则切分
-  let part = 0;
-  while (content.length > 0) {
-    const chunk = content.slice(0, maxSize);
-    content = content.slice(maxSize);
-
-    const outName = `${startOffset + i * (1000 / fps)}_${fileIndex}${part > 0 ? `_p${part}` : ''}.txt`;
-    const outPath = path.join(outDir, outName);
-
-    fs.writeFileSync(outPath, chunk, 'utf-8');
-    console.log(`✅ 写入 ${outPath} (${chunk.length} chars)`);
-
-    part++;
-  }
-  fileIndex++;
+  progressBar.stop();
+  console.log('\n✓ BAS 转换完成!\n');
 }
 
-console.log(`🎉 全部完成，输出在 ${outDir}`);
+main();

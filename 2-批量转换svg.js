@@ -7,9 +7,16 @@ const progress = require('cli-progress');
 program
     .option('-d, --dir <path>', '要处理的目录路径', './video_frames')
     .option('-c, --concurrency <number>', '并发处理数量', 4)
+    .option('-o, --out <path>', 'SVG 输出目录', './svgs')
     .parse(process.argv);
 
 const options = program.opts();
+const outDir = options.out;
+
+// 确保输出目录存在
+if (!fs.existsSync(outDir)) {
+    fs.mkdirSync(outDir, { recursive: true });
+}
 
 const progressBar = new progress.Bar({
     format: '{bar} | {percentage}% | 已处理: {value}/{total} | 当前: {filename}',
@@ -41,21 +48,17 @@ function findPngFiles(dir) {
 }
 
 async function convertFile(filePath) {
-    const dirName = path.dirname(filePath);
     const baseName = path.basename(filePath, '.png');
 
-    const bmpPath = path.join(dirName, `${baseName}.bmp`);
-    const svgPath = path.join(dirName, `${baseName}.svg`);
+    const bmpPath = path.join(outDir, `${baseName}.bmp`);
+    const svgPath = path.join(outDir, `${baseName}.svg`);
 
     progressBar.update(processedCount, { filename: `${baseName}.png` });
 
     try {
         await executeCommand(`magick convert "${filePath}" "${bmpPath}"`);
-
         await executeCommand(`potrace "${bmpPath}" -s -o "${svgPath}"`);
-
         fs.unlinkSync(bmpPath);
-
         return { success: true, file: filePath };
     } catch (error) {
         return { success: false, file: filePath, error };
@@ -125,20 +128,15 @@ async function main() {
         const successful = results.filter(r => r.success).length;
         const failed = results.filter(r => !r.success).length;
 
-        console.log('\n');
-        console.log('✓ 转换完成!');
+        console.log('\n✓ 转换完成!');
         console.log(` 成功: ${successful}`);
-
         if (failed > 0) {
             console.log(` 失败: ${failed}`);
-            console.log('\n失败文件:');
-
             results.filter(r => !r.success).forEach((result, i) => {
                 console.log(`${i + 1}. ${path.relative(options.dir, result.file)}`);
                 console.log(` 错误: ${result.error}`);
             });
         }
-
         console.log('\n');
     } catch (error) {
         spinner.fail('处理过程中发生错误:');

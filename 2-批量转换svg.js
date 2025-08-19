@@ -52,7 +52,7 @@ async function convertFile(filePath) {
     progressBar.update(processedCount, { filename: `${baseName}.png` });
 
     try {
-        await executeCommand(`magick "${filePath}" "${bmpPath}"`);
+        await executeCommand(`convert "${filePath}" "${bmpPath}"`);
         await executeCommand(`potrace "${bmpPath}" -s -o "${svgPath}"`);
         fs.unlinkSync(bmpPath);
         return { success: true, file: filePath };
